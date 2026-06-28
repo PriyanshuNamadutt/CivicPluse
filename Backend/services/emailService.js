@@ -1,24 +1,28 @@
 const nodemailer = require('nodemailer');
 const path = require('path');
 
-const createTransporter = () => {
-  return nodemailer.createTransport({
+const createTransporter = async () => {
+  const transporter = nodemailer.createTransport({
     host: process.env.EMAIL_HOST || 'smtp.gmail.com',
     port: parseInt(process.env.EMAIL_PORT) || 587,
-    secure: false,
+    secure: false,                       // STARTTLS on port 587
     auth: {
       user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS
+      pass: process.env.EMAIL_PASS       // Must be a Gmail App Password
     },
     tls: { rejectUnauthorized: false }
   });
+
+  // Verify SMTP connection before returning — throws immediately if credentials wrong
+  await transporter.verify();
+  return transporter;
 };
 
 /**
  * Send OTP email for verification
  */
 const sendOTPEmail = async (email, otp, purpose) => {
-  const transporter = createTransporter();
+  const transporter = await createTransporter();
   const purposeText = purpose === 'email_verification' ? 'Email Verification' :
     purpose === 'issue_reporting' ? 'Issue Reporting Verification' : 'Password Reset';
 
@@ -50,19 +54,24 @@ const sendOTPEmail = async (email, otp, purpose) => {
     </html>
   `;
 
-  await transporter.sendMail({
-    from: process.env.EMAIL_FROM,
+  const info = await transporter.sendMail({
+    from: {
+      name: 'CivicPulse',
+      address: process.env.EMAIL_USER
+    },
     to: email,
-    subject: `${otp} - Your CivicPulse OTP for ${purposeText}`,
+    subject: `Your CivicPulse verification code is ${otp}`,
+    text: `Your CivicPulse ${purposeText} code is: ${otp}\n\nThis code expires in 10 minutes.\nDo not share this with anyone.`,
     html
   });
+  console.log(`[Email] OTP email sent to ${email} — MessageId: ${info.messageId}`);
 };
 
 /**
  * Send issue report to authority
  */
 const sendIssueToAuthority = async (issue, authorityEmail) => {
-  const transporter = createTransporter();
+  const transporter = await createTransporter();
 
   const mediaLinksHtml = issue.media.map(m =>
     `<a href="${m.url}" style="display:inline-block; margin: 5px; padding: 8px 16px; background: #2e6da4; color: white; border-radius: 6px; text-decoration: none; font-size: 14px;">📎 View ${m.type === 'image' ? 'Photo' : 'Video'}</a>`
@@ -169,7 +178,7 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
  * Send status update email to reporter
  */
 const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
-  const transporter = createTransporter();
+  const transporter = await createTransporter();
 
   const statusColors = {
     reported: '#6c757d', acknowledged: '#17a2b8', in_progress: '#ffc107',
@@ -230,7 +239,7 @@ const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
  * Send badge/certificate email
  */
 const sendBadgeEmail = async (userEmail, userName, badge, certificateBase64) => {
-  const transporter = createTransporter();
+  const transporter = await createTransporter();
 
   const html = `
     <!DOCTYPE html>
