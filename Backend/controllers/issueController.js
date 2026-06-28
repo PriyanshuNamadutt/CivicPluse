@@ -5,19 +5,18 @@ const { sendIssueToAuthority } = require('../services/emailService');
 const { resolveAuthority } = require('../services/authorityService');
 const { getStaticAuthority } = require('../config/authorities');
 const { awardPoints } = require('../services/gamificationService');
-const geolib = require('geolib');
 
-const DUPLICATE_RADIUS = parseInt(process.env.DUPLICATE_RADIUS_METERS) || 50;
+const DUPLICATE_RADIUS = parseInt(process.env.DUPLICATE_RADIUS_METERS) || 100;
 
 // ── POST /api/issues/check-duplicate ──────────────────────────────────────────
-// Duplicate = same location radius AND same assigned department (not just category)
+// Duplicate = within DUPLICATE_RADIUS metres AND same assigned department
 const checkDuplicate = async (req, res) => {
   try {
     const { latitude, longitude, department } = req.body;
     if (!latitude || !longitude) {
       return res.status(400).json({ success: false, message: 'Location required.' });
     }
- 
+
     const query = {
       location: {
         $near: {
@@ -27,16 +26,16 @@ const checkDuplicate = async (req, res) => {
       },
       status: { $nin: ['resolved', 'rejected'] }
     };
- 
-    // Only filter by department when we actually know it (post-AI-analysis)
+
+    // Only filter by department when provided (post-AI-analysis flow)
     if (department) {
       query['assignedAuthority.department'] = department;
     }
- 
+
     const nearbyIssues = await Issue.find(query)
       .select('issueId title category status location reportedAt reporterName media upvoteCount assignedAuthority')
       .limit(5);
- 
+
     if (nearbyIssues.length > 0) {
       return res.json({
         success: true,
@@ -60,29 +59,28 @@ const checkDuplicate = async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
- 
+
 // ── POST /api/issues/analyze-media ───────────────────────────────────────────
-// Returns AI description, category, severity from a raw buffer (no Cloudinary yet)
+// Returns AI description + category from a raw buffer (no Cloudinary upload yet)
 const analyzeMedia = async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No image file provided.' });
     }
- 
+
     const result = await analyzeMediaBuffer(req.file.buffer, req.file.mimetype);
- 
+
     if (!result.success) {
       return res.status(422).json({
         success: false,
         message: result.error || 'AI analysis failed. Please write a description manually.'
       });
     }
- 
+
     res.json({
       success: true,
-      // Return both keys so frontend is unambiguous
-      description: result.aiDescription,
-      aiDescription: result.aiDescription,
+      description: result.aiDescription,   // primary key read by frontend
+      aiDescription: result.aiDescription, // alias for safety
       category: result.category,
       title: result.aiTitle,
       severity: result.severity,
@@ -96,13 +94,11 @@ const analyzeMedia = async (req, res) => {
   }
 };
 
-// POST /api/issues - Report new issue
+// ── POST /api/issues ──────────────────────────────────────────────────────────
 const reportIssue = async (req, res) => {
   try {
     const { description, latitude, longitude, address, ward, city, state, pincode } = req.body;
 
-    // OTP verification is done once at registration — no per-report OTP needed.
-    // Only Aadhaar must be verified (completed during registration).
     if (!req.user.aadhaarVerified) {
       return res.status(403).json({
         success: false,
@@ -110,39 +106,43 @@ const reportIssue = async (req, res) => {
         code: 'AADHAAR_REQUIRED'
       });
     }
-
     if (!latitude || !longitude) {
       return res.status(400).json({ success: false, message: 'Location is required.' });
     }
-
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ success: false, message: 'At least one photo or video is required.' });
     }
+    if (!description || description.trim().length < 10) {
+      return res.status(400).json({ success: false, message: 'Description must be at least 10 characters.' });
+    }
 
-    // Build media array
     const media = req.files.map(file => ({
       url: file.path,
       type: file.mimetype.startsWith('video/') ? 'video' : 'image',
       publicId: file.filename
     }));
 
-    // AI Analysis
+    // ── Step 1: AI analysis — category, title, description, severity ──────────
     const aiResult = await analyzeIssueMedia(media, description);
+    console.log(`[Issue] AI result: category=${aiResult.category} confidence=${aiResult.confidence}`);
 
-    // Resolve authority — AI looks up real government contact by location,
-    // falls back to static map if AI fails or returns low-confidence result.
+    // ── Step 2: Resolve authority via AI + GPS location ───────────────────────
+    // Nominatim reverse-geocodes the coords → city/district/state.
+    // Gemini then identifies the exact responsible department and official
+    // contact for that specific location and category.
+    // Falls back to static map only if AI call fails.
+    const staticFallback = getStaticAuthority(aiResult.category);
     const authority = await resolveAuthority(
       aiResult.category,
+      aiResult.aiDescription || description,
       parseFloat(latitude),
       parseFloat(longitude),
-      address,
-      getStaticAuthority(aiResult.category)
+      staticFallback
     );
-
     console.log(`[Issue] Authority resolved via "${authority.source}": ${authority.name} <${authority.email}>`);
 
-    // Final duplicate check
-      const nearbyDuplicate = await Issue.findOne({
+    // ── Step 3: Duplicate check — same location + same department ─────────────
+    const nearbyDuplicate = await Issue.findOne({
       location: {
         $near: {
           $geometry: { type: 'Point', coordinates: [parseFloat(longitude), parseFloat(latitude)] },
@@ -152,7 +152,7 @@ const reportIssue = async (req, res) => {
       'assignedAuthority.department': authority.department,
       status: { $nin: ['resolved', 'rejected'] }
     });
- 
+
     if (nearbyDuplicate) {
       return res.status(409).json({
         success: false,
@@ -168,9 +168,9 @@ const reportIssue = async (req, res) => {
       });
     }
 
-    // Create issue
+    // ── Step 4: Create issue ──────────────────────────────────────────────────
     const issue = await Issue.create({
-      title: aiResult.aiTitle || description.substring(0, 100),
+      title: aiResult.aiTitle || description.substring(0, 80),
       description,
       category: aiResult.category,
       aiCategory: aiResult.category,
@@ -188,20 +188,21 @@ const reportIssue = async (req, res) => {
       media,
       assignedAuthority: authority,
       updates: [{
-        message: `Issue reported by ${req.user.name}. AI Analysis: ${aiResult.aiDescription || 'Issue categorized as ' + aiResult.category}`,
+        message: `Issue reported by ${req.user.name}. AI: ${aiResult.aiDescription || 'Categorized as ' + aiResult.category}. Assigned to ${authority.name} (${authority.source === 'location' ? authority.city || 'location-based' : 'static'} mapping).`,
         author: 'CivicPulse AI',
         authorType: 'ai'
       }]
     });
 
-    // Send email to authority
+    // ── Step 5: Notify authority by email ─────────────────────────────────────
     try {
       await sendIssueToAuthority(issue, authority.email);
     } catch (emailErr) {
-      console.error('Failed to send email to authority:', emailErr.message);
+      console.error('Authority email failed:', emailErr.message);
+      // Non-fatal — issue is still created
     }
 
-    // Award gamification points
+    // ── Step 6: Award gamification points ────────────────────────────────────
     await awardPoints(req.user._id, 'report_issue');
 
     res.status(201).json({
@@ -217,16 +218,20 @@ const reportIssue = async (req, res) => {
         location: { address: issue.location.address },
         media: issue.media.map(m => ({ url: m.url, type: m.type })),
         reportedAt: issue.reportedAt,
-        assignedAuthority: { name: issue.assignedAuthority.name, department: issue.assignedAuthority.department }
+        assignedAuthority: {
+          name: issue.assignedAuthority.name,
+          department: issue.assignedAuthority.department,
+          source: issue.assignedAuthority.source
+        }
       }
     });
   } catch (error) {
-    console.error('Report issue error:', error);
+    console.error('reportIssue error:', error);
     res.status(500).json({ success: false, message: 'Failed to report issue.' });
   }
 };
 
-// GET /api/issues - List all issues
+// ── GET /api/issues ───────────────────────────────────────────────────────────
 const getIssues = async (req, res) => {
   try {
     const {
@@ -245,8 +250,6 @@ const getIssues = async (req, res) => {
         { issueId: { $regex: search, $options: 'i' } }
       ];
     }
-
-    // Geo filter
     if (latitude && longitude) {
       query.location = {
         $near: {
@@ -270,37 +273,28 @@ const getIssues = async (req, res) => {
     res.json({
       success: true,
       issues,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / parseInt(limit))
-      }
+      pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / parseInt(limit)) }
     });
   } catch (error) {
-    console.error('Get issues error:', error);
+    console.error('getIssues error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch issues.' });
   }
 };
 
-// GET /api/issues/:issueId - Get single issue
+// ── GET /api/issues/:issueId ──────────────────────────────────────────────────
 const getIssue = async (req, res) => {
   try {
     const issue = await Issue.findOne({ issueId: req.params.issueId })
       .select('-assignedAuthority.email -updates.emailMessageId')
       .lean();
-
-    if (!issue) {
-      return res.status(404).json({ success: false, message: 'Issue not found.' });
-    }
-
+    if (!issue) return res.status(404).json({ success: false, message: 'Issue not found.' });
     res.json({ success: true, issue });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to fetch issue.' });
   }
 };
 
-// POST /api/issues/:issueId/upvote
+// ── POST /api/issues/:issueId/upvote ─────────────────────────────────────────
 const upvoteIssue = async (req, res) => {
   try {
     const issue = await Issue.findOne({ issueId: req.params.issueId });
@@ -308,7 +302,6 @@ const upvoteIssue = async (req, res) => {
 
     const userId = req.user._id;
     const hasUpvoted = issue.upvotes.includes(userId);
-
     if (hasUpvoted) {
       issue.upvotes.pull(userId);
       issue.upvoteCount = Math.max(0, issue.upvoteCount - 1);
@@ -316,65 +309,14 @@ const upvoteIssue = async (req, res) => {
       issue.upvotes.push(userId);
       issue.upvoteCount += 1;
     }
-
     await issue.save();
-
     res.json({ success: true, upvoted: !hasUpvoted, upvoteCount: issue.upvoteCount });
   } catch (error) {
     res.status(500).json({ success: false, message: 'Failed to toggle upvote.' });
   }
 };
 
-// POST /api/issues/analyze-preview — quick AI analysis of base64 image (no upload needed)
-// const analyzePreview = async (req, res) => {
-//   try {
-//     const { imageBase64, mimeType } = req.body;
-//     if (!imageBase64) return res.status(400).json({ success: false, message: 'Image data required.' });
-
-//     const axios = require('axios');
-//     const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
-
-//     const requestBody = {
-//       contents: [{
-//         parts: [
-//           {
-//             text: `You are an AI assistant for a civic issue reporting platform in India.
-// Analyze this image of a community/civic problem.
-
-// Respond ONLY with valid JSON (no markdown, no explanation):
-// {
-//   "category": "one of: road_damage, water_supply, electricity, sanitation, garbage, street_light, drainage, parks_recreation, public_property_damage, noise_pollution, encroachment, traffic, other",
-//   "title": "brief title (max 10 words)",
-//   "aiDescription": "2-3 sentence description of what you see and what action is needed",
-//   "severity": "one of: low, medium, high, critical",
-//   "confidence": 0.95
-// }`
-//           },
-//           { inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBase64 } }
-//         ]
-//       }],
-//       generationConfig: { temperature: 0.1, maxOutputTokens: 400 }
-//     };
-
-//     const response = await axios.post(GEMINI_API_URL, requestBody, {
-//       headers: { 'Content-Type': 'application/json' },
-//       timeout: 20000
-//     });
-
-//     const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-//     const clean = text.replace(/```json\n?|\n?```/g, '').trim();
-//     const parsed = JSON.parse(clean);
-
-//     const valid = ['road_damage','water_supply','electricity','sanitation','garbage','street_light',
-//       'drainage','parks_recreation','public_property_damage','noise_pollution','encroachment','traffic','other'];
-//     if (!valid.includes(parsed.category)) parsed.category = 'other';
-
-//     return res.json({ success: true, ...parsed });
-//   } catch (err) {
-//     console.error('Analyze preview error:', err.message);
-//     return res.status(500).json({ success: false, message: 'AI analysis failed.' });
-//   }
-// };
+// ── GET /api/issues/stats/summary ─────────────────────────────────────────────
 const getStats = async (req, res) => {
   try {
     const [total, resolved, inProgress, reported, categories] = await Promise.all([
@@ -391,10 +333,14 @@ const getStats = async (req, res) => {
 
     res.json({
       success: true,
-      stats: { total, resolved, inProgress, reported, resolutionRate: total > 0 ? Math.round((resolved / total) * 100) : 0 },
+      stats: {
+        total, resolved, inProgress, reported,
+        resolutionRate: total > 0 ? Math.round((resolved / total) * 100) : 0
+      },
       categories
     });
   } catch (error) {
+    console.error('getStats error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch stats.' });
   }
 };
