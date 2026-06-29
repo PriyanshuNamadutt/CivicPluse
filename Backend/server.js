@@ -23,18 +23,28 @@ app.use(cors({
   credentials: true
 }));
 
-// Rate limiting
+const isDev = process.env.NODE_ENV === 'development';
+
+// General API rate limiter
+// BUG FIX 1: In dev mode, set max to Infinity so no requests are ever blocked.
+// BUG FIX 2: Added `skip` for auth routes so the general limiter does NOT
+//            double-count /api/auth/* requests (it was silently blocking OTP
+//            delivery by consuming the 100-req quota before authLimiter ran).
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100,
+  windowMs: 15 * 60 * 1000,
+  max: isDev ? Infinity : 100,
+  skip: (req) => req.path.startsWith('/auth/'), // skip — authLimiter handles these
   message: { success: false, message: 'Too many requests, please try again later.' }
 });
 app.use('/api/', limiter);
 
-// Strict limiter for auth routes
+// Strict limiter for auth routes only
+// BUG FIX 3: Was set to max:10000 (effectively unlimited but inconsistent).
+//            Now clearly Infinity in dev, and a sane 10 in production to
+//            prevent OTP/login brute-force without blocking legitimate sends.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10000,
+  max: isDev ? Infinity : 10,
   message: { success: false, message: 'Too many auth requests. Please wait 15 minutes.' }
 });
 app.use('/api/auth/', authLimiter);
@@ -44,13 +54,17 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Logger
-if (process.env.NODE_ENV === 'development') {
+if (isDev) {
   app.use(morgan('dev'));
 }
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ success: true, message: 'CivicPulse API is running', timestamp: new Date().toISOString() });
+  res.json({
+    success: true,
+    message: 'CivicPulse API is running',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // API Routes
@@ -79,6 +93,7 @@ const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`🚀 CivicPulse Server running on port ${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔒 Rate limiting: ${isDev ? 'DISABLED (development)' : 'ENABLED (production)'}`);
 });
 
 // Start email monitoring (IMAP) after server starts
