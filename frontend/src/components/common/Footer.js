@@ -36,7 +36,7 @@ export default function Footer() {
           </div>
         </div>
         <div style={{ borderTop: '1px solid #334155', paddingTop: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
-          <p style={{ color: '#64748b', fontSize: 13, margin: 0 }}>© 2024 CivicPulse. All rights reserved.</p>
+          <p style={{ color: '#64748b', fontSize: 13, margin: 0 }}>© 2026 CivicPulse. All rights reserved.</p>
           <p style={{ color: '#64748b', fontSize: 13, margin: 0 }}>🇮🇳 Made for India's citizens</p>
         </div>
       </div>
