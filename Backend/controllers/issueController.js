@@ -62,7 +62,10 @@ const reportIssue = async (req, res) => {
       parseFloat(longitude),
       staticFallback
     );
-    console.log(`[reportIssue] Authority (${authority.source}): ${authority.name} | ${authority.department} | ${authority.email}`);
+    console.log(`[reportIssue] Authority (${authority.source}): ${authority.name} | ${authority.department} | email=${authority.email} | emailSource=${authority.emailSource}`);
+    if (authority.groundingSources?.length) {
+      console.log(`[reportIssue] Grounding sources: ${authority.groundingSources.slice(0, 2).join(', ')}`);
+    }
 
     // ── Step 4: Duplicate check — 50m radius + same authority department ──────
     // If BOTH conditions match → this issue is already filed → tell the user.
@@ -116,12 +119,17 @@ const reportIssue = async (req, res) => {
       },
       media,
       assignedAuthority: {
-        name:       authority.name,
-        department: authority.department,
-        email:      authority.email,
-        phone:      authority.phone       || '',
-        jurisdiction: authority.jurisdiction || '',
-        source:     authority.source
+        name:            authority.name,
+        department:      authority.department,
+        email:           authority.email,
+        phone:           authority.phone           || '',
+        jurisdiction:    authority.jurisdiction    || '',
+        website:         authority.website         || null,
+        grievancePortal: authority.grievancePortal || null,
+        emailSource:     authority.emailSource     || 'none',
+        source:          authority.source,
+        groundingSources:authority.groundingSources|| [],
+        notes:           authority.notes           || ''
       },
       updates: [{
         message: `Issue reported by ${req.user.name}. ` +
@@ -160,11 +168,15 @@ const reportIssue = async (req, res) => {
         media: issue.media.map(m => ({ url: m.url, type: m.type })),
         reportedAt: issue.reportedAt,
         assignedAuthority: {
-          name:         issue.assignedAuthority.name,
-          department:   issue.assignedAuthority.department,
-          phone:        issue.assignedAuthority.phone,
-          jurisdiction: issue.assignedAuthority.jurisdiction,
-          source:       issue.assignedAuthority.source
+          name:            issue.assignedAuthority.name,
+          department:      issue.assignedAuthority.department,
+          phone:           issue.assignedAuthority.phone,
+          jurisdiction:    issue.assignedAuthority.jurisdiction,
+          website:         issue.assignedAuthority.website,
+          grievancePortal: issue.assignedAuthority.grievancePortal,
+          emailSource:     issue.assignedAuthority.emailSource,
+          source:          issue.assignedAuthority.source,
+          notes:           issue.assignedAuthority.notes
           // email intentionally omitted from response
         }
       }
