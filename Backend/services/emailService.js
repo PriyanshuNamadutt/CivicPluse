@@ -1,30 +1,48 @@
 const nodemailer = require('nodemailer');
-const path = require('path');
 
-const createTransporter = async () => {
-  const transporter = nodemailer.createTransport({
-    host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-    port: parseInt(process.env.EMAIL_PORT) || 587,
-    secure: false,                       // STARTTLS on port 587
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS       // Must be a Gmail App Password
-    },
-    tls: { rejectUnauthorized: false }
-  });
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.EMAIL_PORT) || 587,
+  secure: false,          // false = STARTTLS on 587 (NOT SSL/465)
+  requireTLS: true,       // force TLS upgrade — reject plain-text fallback
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS  // Must be a Gmail App Password, NOT account password
+  },
+  tls: {
+    rejectUnauthorized: true  // BUG FIX 2: was false — unsafe and causes silent hangs
+  },
+  connectionTimeout: 10000,   // BUG FIX 3: was unset → 120s hang on Render
+  greetingTimeout:  10000,
+  socketTimeout:    15000
+});
 
-  // Verify SMTP connection before returning — throws immediately if credentials wrong
-  await transporter.verify();
-  return transporter;
+// Verify once at startup — surfaces credential/port errors immediately in logs
+// instead of silently failing on first email send.
+transporter.verify((err) => {
+  if (err) {
+    console.error('[SMTP] ❌ Connection failed:', err.message);
+    console.error('[SMTP] Check EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS in Render env vars');
+  } else {
+    console.log('[SMTP] ✅ Ready — connected to', process.env.EMAIL_HOST || 'smtp.gmail.com');
+  }
+});
+
+// BUG FIX 4: Unified sender across all functions — falls back gracefully if
+// EMAIL_FROM is missing from env (the most common Render misconfiguration).
+const FROM_ADDRESS = {
+  name: 'CivicPulse',
+  address: process.env.EMAIL_FROM || process.env.EMAIL_USER
 };
 
 /**
  * Send OTP email for verification
  */
 const sendOTPEmail = async (email, otp, purpose) => {
-  const transporter = await createTransporter();
-  const purposeText = purpose === 'email_verification' ? 'Email Verification' :
-    purpose === 'issue_reporting' ? 'Issue Reporting Verification' : 'Password Reset';
+  const purposeText =
+    purpose === 'email_verification'  ? 'Email Verification'          :
+    purpose === 'issue_reporting'     ? 'Issue Reporting Verification' :
+                                        'Password Reset';
 
   const html = `
     <!DOCTYPE html>
@@ -55,24 +73,20 @@ const sendOTPEmail = async (email, otp, purpose) => {
   `;
 
   const info = await transporter.sendMail({
-    from: {
-      name: 'CivicPulse',
-      address: process.env.EMAIL_USER
-    },
+    from: FROM_ADDRESS,  // BUG FIX 4: was process.env.EMAIL_USER (plain string, no display name)
     to: email,
     subject: `Your CivicPulse verification code is ${otp}`,
     text: `Your CivicPulse ${purposeText} code is: ${otp}\n\nThis code expires in 10 minutes.\nDo not share this with anyone.`,
     html
   });
-  console.log(`[Email] OTP email sent to ${email} — MessageId: ${info.messageId}`);
+
+  console.log(`[Email] OTP sent to ${email} — MessageId: ${info.messageId}`);
 };
 
 /**
  * Send issue report to authority
  */
 const sendIssueToAuthority = async (issue, authorityEmail) => {
-  const transporter = await createTransporter();
-
   const mediaLinksHtml = issue.media.map(m =>
     `<a href="${m.url}" style="display:inline-block; margin: 5px; padding: 8px 16px; background: #2e6da4; color: white; border-radius: 6px; text-decoration: none; font-size: 14px;">📎 View ${m.type === 'image' ? 'Photo' : 'Video'}</a>`
   ).join('');
@@ -94,7 +108,6 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
           <div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
             <strong>⚠️ Issue ID: ${issue.issueId}</strong>
           </div>
-          
           <table style="width: 100%; border-collapse: collapse;">
             <tr style="background: #f8f9fa;">
               <td style="padding: 12px; border: 1px solid #dee2e6; font-weight: 600; width: 40%;">Category</td>
@@ -129,7 +142,7 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
               <td style="padding: 12px; border: 1px solid #dee2e6;">${issue.location.address || 'See coordinates'}<br><small style="color: #888;">Lat: ${issue.location.coordinates[1]}, Lng: ${issue.location.coordinates[0]}</small></td>
             </tr>
           </table>
-          
+
           <div style="margin-top: 20px;">
             <h3 style="color: #1e3a5f;">📸 Proof of Issue</h3>
             <div>${mediaLinksHtml || '<p style="color:#888">No media attached</p>'}</div>
@@ -146,7 +159,7 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
           </div>
 
           <div style="text-align: center; margin-top: 25px;">
-            <a href="${process.env.FRONTEND_URL}/track/${issue.issueId}" 
+            <a href="${process.env.FRONTEND_URL}/track/${issue.issueId}"
                style="display:inline-block; padding: 12px 30px; background: #1e3a5f; color: white; border-radius: 8px; text-decoration: none; font-weight: 600;">
               🔍 View Issue on CivicPulse
             </a>
@@ -161,7 +174,7 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
   `;
 
   const info = await transporter.sendMail({
-    from: process.env.EMAIL_FROM,
+    from: FROM_ADDRESS,  // BUG FIX 4: was process.env.EMAIL_FROM (unset on Render = crash)
     to: authorityEmail,
     subject: `[CivicPulse] [${issue.issueId}] New Issue: ${issue.title} - ${issue.severity.toUpperCase()} Priority`,
     html,
@@ -178,8 +191,6 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
  * Send status update email to reporter
  */
 const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
-  const transporter = await createTransporter();
-
   const statusColors = {
     reported: '#6c757d', acknowledged: '#17a2b8', in_progress: '#ffc107',
     resolved: '#28a745', rejected: '#dc3545'
@@ -196,17 +207,14 @@ const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
         <div style="padding: 30px;">
           <h2 style="color: #1e3a5f;">Issue Update: ${issue.issueId}</h2>
           <p style="color: #555;">Your reported issue "<strong>${issue.title}</strong>" has been updated.</p>
-          
           <div style="background: #f8f9fa; border-radius: 8px; padding: 15px; margin: 15px 0;">
-            <strong>New Status:</strong> 
+            <strong>New Status:</strong>
             <span style="background: ${statusColors[issue.status] || '#888'}; color: white; padding: 3px 10px; border-radius: 12px; font-size: 13px; margin-left: 8px;">${issue.status.replace(/_/g, ' ').toUpperCase()}</span>
           </div>
-          
           <div style="background: #f0f4f8; border-radius: 8px; padding: 15px;">
             <strong>Authority Message:</strong>
             <p style="color: #555; margin: 8px 0 0;">${update.message}</p>
           </div>
-          
           ${issue.status === 'resolved' ? `
           <div style="background: #d4edda; border: 1px solid #c3e6cb; border-radius: 8px; padding: 15px; margin-top: 15px;">
             <strong>✅ Issue Resolved!</strong>
@@ -214,9 +222,8 @@ const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
             ${update.aiVerificationNote ? `<p style="color: #555; font-size: 13px;">AI Verification: ${update.aiVerificationNote}</p>` : ''}
           </div>
           ` : ''}
-          
           <div style="text-align: center; margin-top: 25px;">
-            <a href="${process.env.FRONTEND_URL}/track/${issue.issueId}" 
+            <a href="${process.env.FRONTEND_URL}/track/${issue.issueId}"
                style="display:inline-block; padding: 12px 30px; background: #1e3a5f; color: white; border-radius: 8px; text-decoration: none; font-weight: 600;">
               🔍 Track Your Issue
             </a>
@@ -228,7 +235,7 @@ const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
   `;
 
   await transporter.sendMail({
-    from: process.env.EMAIL_FROM,
+    from: FROM_ADDRESS,  // BUG FIX 4
     to: reporterEmail,
     subject: `[CivicPulse] Issue ${issue.issueId} Update: ${issue.status.replace(/_/g, ' ').toUpperCase()}`,
     html
@@ -239,8 +246,6 @@ const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
  * Send badge/certificate email
  */
 const sendBadgeEmail = async (userEmail, userName, badge, certificateBase64) => {
-  const transporter = await createTransporter();
-
   const html = `
     <!DOCTYPE html>
     <html>
@@ -256,7 +261,7 @@ const sendBadgeEmail = async (userEmail, userName, badge, certificateBase64) => 
           <p style="color: #777;">${badge.description}</p>
           <p style="color: #555;">Thank you for your active participation in making your community better!</p>
           <div style="margin-top: 25px;">
-            <a href="${process.env.FRONTEND_URL}/profile" 
+            <a href="${process.env.FRONTEND_URL}/profile"
                style="display:inline-block; padding: 12px 30px; background: #1e3a5f; color: white; border-radius: 8px; text-decoration: none; font-weight: 600;">
               View Your Profile
             </a>
@@ -277,7 +282,7 @@ const sendBadgeEmail = async (userEmail, userName, badge, certificateBase64) => 
   }
 
   await transporter.sendMail({
-    from: process.env.EMAIL_FROM,
+    from: FROM_ADDRESS,  // BUG FIX 4
     to: userEmail,
     subject: `🏆 You earned the "${badge.name}" badge on CivicPulse!`,
     html,
