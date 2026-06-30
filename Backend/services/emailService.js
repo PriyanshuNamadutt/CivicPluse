@@ -1,17 +1,55 @@
-const { Resend } = require('resend');
+const axios = require('axios');
 
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
 
-if (!process.env.RESEND_API_KEY) {
-  console.error('[Resend] ❌ RESEND_API_KEY is missing from environment variables');
+if (!BREVO_API_KEY) {
+  console.error('[Brevo] ❌ BREVO_API_KEY is missing from environment variables');
 }
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'no-reply@example.com';
+const FROM_NAME  = process.env.BREVO_FROM_NAME  || 'CivicPulse';
 
-// Resend requires `from` to be either:
-//   - onboarding@resend.dev   (works immediately, no setup — testing only)
-//   - someone@yourverifieddomain.com  (after verifying a domain in dashboard)
-// Set RESEND_FROM_EMAIL in your env once you verify a domain.
-const FROM_ADDRESS = process.env.RESEND_FROM_EMAIL || 'CivicPulse <onboarding@resend.dev>';
+/**
+ * Low-level sender — posts to Brevo's transactional email endpoint.
+ * Throws on failure so callers can catch/log/handle as before.
+ */
+const sendViaBrevo = async ({ to, subject, html, text, replyTo, attachments }) => {
+  const payload = {
+    sender: { email: FROM_EMAIL, name: FROM_NAME },
+    to: [{ email: to }],
+    subject,
+    htmlContent: html,
+  };
+
+  if (text) payload.textContent = text;
+  if (replyTo) payload.replyTo = { email: replyTo };
+
+  // Brevo expects attachments as base64 content + name
+  if (attachments && attachments.length) {
+    payload.attachment = attachments.map(a => ({
+      name: a.filename,
+      content: a.content // must already be base64 string (no data: prefix)
+    }));
+  }
+
+  try {
+    const res = await axios.post(BREVO_API_URL, payload, {
+      headers: {
+        'api-key': BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      timeout: 15000
+    });
+    // Brevo returns { messageId: "<...>" } on success
+    return { id: res.data?.messageId };
+  } catch (err) {
+    const apiError = err.response?.data;
+    console.error('[Brevo] Send failed:', apiError || err.message);
+    throw new Error(apiError?.message || err.message || 'Failed to send email via Brevo');
+  }
+};
 
 /**
  * Send OTP email for verification
@@ -50,18 +88,12 @@ const sendOTPEmail = async (email, otp, purpose) => {
     </html>
   `;
 
-  const { data, error } = await resend.emails.send({
-    from: FROM_ADDRESS,
+  const data = await sendViaBrevo({
     to: email,
     subject: `Your CivicPulse verification code is ${otp}`,
     text: `Your CivicPulse ${purposeText} code is: ${otp}\n\nThis code expires in 10 minutes.\nDo not share this with anyone.`,
     html
   });
-
-  if (error) {
-    console.error('[Resend] OTP send failed:', error);
-    throw new Error(error.message || 'Failed to send OTP email');
-  }
 
   console.log(`[Email] OTP sent to ${email} — MessageId: ${data.id}`);
   return data;
@@ -157,22 +189,14 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
     </html>
   `;
 
-  // NOTE: Resend's free tier only supports `replyTo`, not arbitrary custom
-  // headers like the old nodemailer 'Message-ID'/'X-Issue-ID'. We fold the
-  // issue ID into the subject (already present) which is sufficient for the
-  // IMAP reply-parsing service to match it via regex on the subject line.
-  const { data, error } = await resend.emails.send({
-    from: FROM_ADDRESS,
+  // NOTE: replyTo lets authority replies land in your IMAP inbox so the
+  // imapService can parse [STATUS: ...] updates from their reply.
+  const data = await sendViaBrevo({
     to: authorityEmail,
-    replyTo: process.env.EMAIL_REPLY_TO || undefined, // set if replies should route to your IMAP inbox
+    replyTo: process.env.EMAIL_REPLY_TO || undefined,
     subject: `[CivicPulse] [${issue.issueId}] New Issue: ${issue.title} - ${issue.severity.toUpperCase()} Priority`,
     html
   });
-
-  if (error) {
-    console.error('[Resend] Authority email failed:', error);
-    throw new Error(error.message || 'Failed to send issue report email');
-  }
 
   return data;
 };
@@ -224,17 +248,11 @@ const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
     </html>
   `;
 
-  const { data, error } = await resend.emails.send({
-    from: FROM_ADDRESS,
+  const data = await sendViaBrevo({
     to: reporterEmail,
     subject: `[CivicPulse] Issue ${issue.issueId} Update: ${issue.status.replace(/_/g, ' ').toUpperCase()}`,
     html
   });
-
-  if (error) {
-    console.error('[Resend] Status update email failed:', error);
-    throw new Error(error.message || 'Failed to send status update email');
-  }
 
   return data;
 };
@@ -273,22 +291,16 @@ const sendBadgeEmail = async (userEmail, userName, badge, certificateBase64) => 
   if (certificateBase64) {
     attachments.push({
       filename: `CivicPulse_Certificate_${badge.name.replace(/\s/g, '_')}.pdf`,
-      content: certificateBase64 // Resend accepts base64 string directly for `content`
+      content: certificateBase64 // already base64 — Brevo expects raw base64, no data: prefix
     });
   }
 
-  const { data, error } = await resend.emails.send({
-    from: FROM_ADDRESS,
+  const data = await sendViaBrevo({
     to: userEmail,
     subject: `🏆 You earned the "${badge.name}" badge on CivicPulse!`,
     html,
     attachments
   });
-
-  if (error) {
-    console.error('[Resend] Badge email failed:', error);
-    throw new Error(error.message || 'Failed to send badge email');
-  }
 
   return data;
 };
